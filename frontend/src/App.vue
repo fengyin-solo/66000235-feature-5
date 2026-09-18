@@ -33,6 +33,29 @@
         </div>
       </div>
 
+      <!-- Scenario Selector -->
+      <div class="mb-5">
+        <h3 class="text-sm font-semibold text-gray-300 mb-2">采集场景</h3>
+        <div class="grid grid-cols-2 gap-1.5">
+          <button
+            v-for="opt in scenarioOptions"
+            :key="opt.value"
+            @click="store.setScenario(opt.value)"
+            :class="[
+              'px-2 py-1.5 rounded text-xs font-medium transition-all',
+              store.scenario === opt.value
+                ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/50'
+                : 'bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600 hover:text-gray-300',
+            ]"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
+        <p class="text-xs text-gray-500 mt-1">
+          判定口径: 过速&gt;{{ store.currentCriteria.tachycardiaHr }} / 过缓&lt;{{ store.currentCriteria.bradycardiaHr }} BPM
+        </p>
+      </div>
+
       <!-- Heart Rate Control -->
       <div class="mb-5">
         <h3 class="text-sm font-semibold text-gray-300 mb-2">
@@ -133,6 +156,10 @@
           <span class="text-sm text-gray-400">
             导联: <span class="text-emerald-400 font-medium">{{ store.selectedLead }}</span>
           </span>
+          <span class="text-xs text-gray-500">|</span>
+          <span class="text-sm text-gray-400">
+            场景: <span class="text-cyan-400 font-medium">{{ store.currentCriteria.label }}</span>
+          </span>
         </div>
         <div class="text-sm text-gray-400">
           诊断: <span class="text-cyan-300">{{ store.rhythmDiagnosis || '等待分析...' }}</span>
@@ -230,9 +257,15 @@ import { useECGStore } from './store/ecg';
 import ECGWaveform from './components/ECGWaveform.vue';
 import HRVAnalysis from './components/HRVAnalysis.vue';
 import { LEAD_NAMES } from './types';
+import type { Scenario } from './types';
 
 const store = useECGStore();
 const leadNames = LEAD_NAMES;
+
+const scenarioOptions: { value: Scenario; label: string }[] = [
+  { value: 'rest', label: '静息' },
+  { value: 'exercise', label: '运动' },
+];
 
 const avgRR = computed(() => {
   if (!store.hrvData || store.hrvData.nnIntervals.length === 0) return '--';

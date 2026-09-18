@@ -58,9 +58,10 @@ async def analyze_ecg(request: ECGAnalysisRequest):
     hrv_raw = calculate_hrv(r_peaks_raw, request.sampling_rate)
     hrv = HRVMetrics(**hrv_raw)
 
-    # Detect arrhythmia events
+    # Detect arrhythmia events (using the selected scenario's criteria)
     arrhythmia_raw = detect_arrhythmia(
-        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate
+        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate,
+        scenario=request.scenario.value,
     )
     arrhythmia_events = []
     for evt in arrhythmia_raw:
@@ -74,7 +75,7 @@ async def analyze_ecg(request: ECGAnalysisRequest):
         )
 
     # Generate rhythm diagnosis
-    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw)
+    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw, scenario=request.scenario.value)
 
     # Build lead data
     lead = ECGLead(
@@ -90,4 +91,5 @@ async def analyze_ecg(request: ECGAnalysisRequest):
         hrv=hrv,
         arrhythmia_events=arrhythmia_events,
         rhythm_diagnosis=diagnosis,
+        scenario=request.scenario,
     )

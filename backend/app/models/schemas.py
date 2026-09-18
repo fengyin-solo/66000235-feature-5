@@ -27,6 +27,13 @@ class ArrhythmiaType(str, Enum):
     PVC = "premature_ventricular_contraction"
 
 
+class ScenarioType(str, Enum):
+    """Acquisition scenario — selects which rhythm criteria set is applied."""
+
+    REST = "rest"
+    EXERCISE = "exercise"
+
+
 class RPeak(BaseModel):
     index: int = Field(..., description="Sample index of R-peak")
     time: float = Field(..., description="Time in seconds")
@@ -61,6 +68,7 @@ class ECGAnalysisRequest(BaseModel):
     duration: float = Field(default=10.0, ge=1.0, le=60.0, description="Duration in seconds")
     sampling_rate: int = Field(default=500, ge=100, le=1000, description="Sampling rate in Hz")
     heart_rate: float = Field(default=72.0, ge=30, le=200, description="Simulated heart rate BPM")
+    scenario: ScenarioType = Field(default=ScenarioType.REST, description="Acquisition scenario: rest or exercise")
 
 
 class ECGAnalysisResponse(BaseModel):
@@ -68,3 +76,4 @@ class ECGAnalysisResponse(BaseModel):
     hrv: HRVMetrics = Field(..., description="HRV analysis results")
     arrhythmia_events: List[ArrhythmiaEvent] = Field(default_factory=list, description="Detected arrhythmia events")
     rhythm_diagnosis: str = Field(..., description="Overall rhythm diagnosis")
+    scenario: ScenarioType = Field(default=ScenarioType.REST, description="Criteria set applied for this analysis")

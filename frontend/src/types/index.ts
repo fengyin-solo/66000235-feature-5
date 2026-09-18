@@ -6,6 +6,8 @@ export interface ECGLead {
   rPeaks: RPeak[];
 }
 
+export type Scenario = 'rest' | 'exercise';
+
 export interface RPeak {
   index: number;
   time: number;
@@ -27,11 +29,30 @@ export interface ArrhythmiaEvent {
   timestamp: number;
 }
 
+// Backend API payload (snake_case, mirrors the FastAPI response model)
 export interface ECGAnalysisResponse {
-  lead: ECGLead;
-  hrv: HRVData;
-  arrhythmiaEvents: ArrhythmiaEvent[];
-  rhythmDiagnosis: string;
+  lead: {
+    lead_name: string;
+    sampling_rate: number;
+    duration: number;
+    samples: number[];
+    r_peaks: { index: number; time: number; amplitude: number }[];
+  };
+  hrv: {
+    heart_rate: number;
+    sdnn: number;
+    rmssd: number;
+    pnn50: number;
+    nn_intervals: number[];
+  };
+  arrhythmia_events: {
+    event_type: string;
+    confidence: number;
+    description: string;
+    timestamp: number;
+  }[];
+  rhythm_diagnosis: string;
+  scenario: Scenario;
 }
 
 export interface ECGAnalysisRequest {
@@ -39,6 +60,7 @@ export interface ECGAnalysisRequest {
   duration: number;
   samplingRate: number;
   heartRate: number;
+  scenario: Scenario;
 }
 
 export const LEAD_NAMES: string[] = [

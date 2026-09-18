@@ -1,7 +1,52 @@
+import hashlib
+
 import numpy as np
 from scipy import signal
 from typing import List, Tuple, Dict, Any
 import math
+
+
+# Rhythm criteria per acquisition scenario (采集场景判定口径).
+# 静息 (rest) keeps the original fixed thresholds; 运动 (exercise) uses looser
+# limits to account for the physiologically elevated heart rate during activity.
+#
+# Boundary rule (边界口径): a heart rate exactly equal to a threshold is NOT
+# flagged — tachycardia requires HR strictly above the upper limit and
+# bradycardia requires HR strictly below the lower limit — so a boundary value
+# can never be judged as both normal and abnormal.
+RHYTHM_CRITERIA: Dict[str, Dict[str, Any]] = {
+    "rest": {
+        "label": "静息",
+        "tachycardia_hr": 100.0,  # 心动过速: HR > 100 BPM
+        "bradycardia_hr": 60.0,   # 心动过缓: HR < 60 BPM
+        "irregular_cv": 0.15,     # 心律不规则: RR 间期变异系数 > 0.15
+    },
+    "exercise": {
+        "label": "运动",
+        "tachycardia_hr": 160.0,  # 心动过速: HR > 160 BPM
+        "bradycardia_hr": 50.0,   # 心动过缓: HR < 50 BPM
+        "irregular_cv": 0.25,     # 心律不规则: RR 间期变异系数 > 0.25
+    },
+}
+
+DEFAULT_SCENARIO = "rest"
+
+
+def get_rhythm_criteria(scenario: str = DEFAULT_SCENARIO) -> Dict[str, Any]:
+    """Return the rhythm criteria set for the given acquisition scenario."""
+    return RHYTHM_CRITERIA.get(scenario, RHYTHM_CRITERIA[DEFAULT_SCENARIO])
+
+
+def _derive_signal_seed(*parts: Any) -> int:
+    """
+    Derive a deterministic seed from the request parameters.
+
+    Identical inputs always produce the same seed, so re-submitting the same
+    data yields exactly the same generated signal (and analysis result).
+    """
+    payload = "|".join(str(p) for p in parts)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
 
 
 def gaussian(x: np.ndarray, amplitude: float, center: float, width: float) -> np.ndarray:
@@ -101,6 +146,13 @@ def generate_ecg_signal(
     t = np.linspace(0, duration, total_samples)
     ecg = np.zeros(total_samples)
 
+    # Deterministic RNG seeded from the request parameters: re-submitting the
+    # same data reproduces the identical signal instead of a fresh random one.
+    seed = _derive_signal_seed(
+        lead_name, duration, sampling_rate, heart_rate, noise_level, include_arrhythmia
+    )
+    rng = np.random.default_rng(seed)
+
     lead_config = get_lead_config(lead_name)
     cycle_duration = 60.0 / heart_rate
 
@@ -115,13 +167,13 @@ def generate_ecg_signal(
         t_cycle = t[mask] - start_time
         
         # Add slight HRV variation to each beat
-        hrv_factor = 1.0 + np.random.normal(0, 0.02)
+        hrv_factor = 1.0 + rng.normal(0, 0.02)
         modified_hr = heart_rate * hrv_factor
         cycle_config = lead_config.copy()
 
         # Simulate arrhythmia if requested
         if include_arrhythmia and beat_count > 2:
-            if np.random.random() < 0.1:  # 10% chance of PVC
+            if rng.random() < 0.1:  # 10% chance of PVC
                 cycle_config["r_amplitude"] *= 1.8
                 cycle_config["t_amplitude"] *= -0.5
                 cycle_config["q_amplitude"] *= 0.5
@@ -133,7 +185,7 @@ def generate_ecg_signal(
     baseline_wander = 0.03 * np.sin(2 * np.pi * 0.15 * t)
     
     # Add high-frequency noise (muscle artifact)
-    noise = noise_level * np.random.randn(total_samples)
+    noise = noise_level * rng.standard_normal(total_samples)
 
     ecg = ecg + baseline_wander + noise
 
@@ -256,33 +308,41 @@ def detect_arrhythmia(
     hrv: Dict[str, Any],
     ecg_signal: np.ndarray,
     sampling_rate: int = 500,
+    scenario: str = DEFAULT_SCENARIO,
 ) -> List[Dict[str, Any]]:
     """
     Detect arrhythmia events based on R-peaks, HRV metrics, and signal morphology.
-    
+
     Detects:
-    - Tachycardia: HR > 100 BPM
-    - Bradycardia: HR < 60 BPM
+    - Tachycardia: HR above the scenario's upper limit
+    - Bradycardia: HR below the scenario's lower limit
     - ST-segment elevation: potential myocardial infarction
-    - Irregular rhythm patterns
+    - Irregular rhythm patterns: RR-interval CV above the scenario's limit
+
+    The heart-rate limits come from the selected acquisition scenario
+    (see RHYTHM_CRITERIA). A heart rate exactly on a limit is not flagged,
+    so boundary values are never judged as both normal and abnormal.
     """
     events = []
     heart_rate = hrv["heart_rate"]
+    criteria = get_rhythm_criteria(scenario)
+    tachycardia_hr = criteria["tachycardia_hr"]
+    bradycardia_hr = criteria["bradycardia_hr"]
 
     # Tachycardia detection
-    if heart_rate > 100:
+    if heart_rate > tachycardia_hr:
         events.append({
             "event_type": "tachycardia",
-            "confidence": min(1.0, (heart_rate - 100) / 50 + 0.6),
+            "confidence": min(1.0, (heart_rate - tachycardia_hr) / 50 + 0.6),
             "description": f"心率过快 ({heart_rate:.0f} BPM)，检测到心动过速",
             "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
         })
 
     # Bradycardia detection
-    if heart_rate < 60 and heart_rate > 0:
+    if 0 < heart_rate < bradycardia_hr:
         events.append({
             "event_type": "bradycardia",
-            "confidence": min(1.0, (60 - heart_rate) / 30 + 0.6),
+            "confidence": min(1.0, (bradycardia_hr - heart_rate) / 30 + 0.6),
             "description": f"心率过慢 ({heart_rate:.0f} BPM)，检测到心动过缓",
             "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
         })
@@ -310,11 +370,11 @@ def detect_arrhythmia(
                 "timestamp": r_peaks[0]["time"],
             })
 
-    # Irregular rhythm detection (high SDNN relative to mean)
+    # Irregular rhythm detection (RR-interval coefficient of variation)
     if len(hrv.get("nn_intervals", [])) > 3:
         nn_array = np.array(hrv["nn_intervals"])
         cv = np.std(nn_array) / np.mean(nn_array) if np.mean(nn_array) > 0 else 0
-        if cv > 0.15:
+        if cv > criteria["irregular_cv"]:
             events.append({
                 "event_type": "atrial_fibrillation",
                 "confidence": min(1.0, cv * 2),
@@ -334,21 +394,30 @@ def detect_arrhythmia(
     return events
 
 
-def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str, Any]) -> str:
-    """Generate overall rhythm diagnosis based on detected events and HRV."""
+def get_rhythm_diagnosis(
+    arrhythmia_events: List[Dict[str, Any]],
+    hrv: Dict[str, Any],
+    scenario: str = DEFAULT_SCENARIO,
+) -> str:
+    """
+    Generate overall rhythm diagnosis based on detected events and HRV.
+
+    The conclusion always states which criteria set (判定口径) was applied.
+    """
     event_types = [e["event_type"] for e in arrhythmia_events]
+    criteria_note = f"判定口径: {get_rhythm_criteria(scenario)['label']}"
 
     if "st_elevation" in event_types:
-        return "ST 段抬高 - 建议立即就医检查"
+        return f"ST 段抬高 - 建议立即就医检查 | {criteria_note}"
     elif "tachycardia" in event_types and "atrial_fibrillation" in event_types:
-        return "快速房颤 - 建议进一步心脏评估"
+        return f"快速房颤 - 建议进一步心脏评估 | {criteria_note}"
     elif "tachycardia" in event_types:
-        return "窦性心动过速 - 请结合临床症状判断"
+        return f"窦性心动过速 - 请结合临床症状判断 | {criteria_note}"
     elif "bradycardia" in event_types:
-        return "窦性心动过缓 - 建议关注心率变化"
+        return f"窦性心动过缓 - 建议关注心率变化 | {criteria_note}"
     elif "atrial_fibrillation" in event_types:
-        return "心律不规则 - 疑似房颤，建议 Holter 监测"
+        return f"心律不规则 - 疑似房颤，建议 Holter 监测 | {criteria_note}"
     else:
         hr = hrv.get("heart_rate", 0)
         sdnn = hrv.get("sdnn", 0)
-        return f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms"
+        return f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms | {criteria_note}"

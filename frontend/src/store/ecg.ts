@@ -1,10 +1,46 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse, Scenario } from '../types';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
   return amplitude * Math.exp(-((x - center) ** 2) / (2 * width ** 2));
+}
+
+// Rhythm criteria per acquisition scenario (采集场景判定口径), mirrors the backend.
+// Boundary rule: a heart rate exactly equal to a limit is NOT flagged (strict
+// inequality), so a boundary value is never judged as both normal and abnormal.
+interface RhythmCriteria {
+  label: string;
+  tachycardiaHr: number; // 心动过速: HR > tachycardiaHr
+  bradycardiaHr: number; // 心动过缓: HR < bradycardiaHr
+}
+
+const RHYTHM_CRITERIA: Record<Scenario, RhythmCriteria> = {
+  rest: { label: '静息', tachycardiaHr: 100, bradycardiaHr: 60 },
+  exercise: { label: '运动', tachycardiaHr: 160, bradycardiaHr: 50 },
+};
+
+// Deterministic PRNG (mulberry32) so re-submitting the same data reproduces
+// the identical waveform instead of a fresh random one.
+function hashString(str: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 // Lead-specific PQRST configuration
@@ -49,6 +85,7 @@ export const useECGStore = defineStore('ecg', () => {
   const heartRate = ref<number>(72);
   const samplingRate = ref<number>(500);
   const duration = ref<number>(10);
+  const scenario = ref<Scenario>('rest');
   const isMonitoring = ref<boolean>(false);
   const ecgData = ref<ECGLead | null>(null);
   const hrvData = ref<HRVData | null>(null);
@@ -65,6 +102,7 @@ export const useECGStore = defineStore('ecg', () => {
   const currentSamples = computed(() => ecgData.value?.samples ?? []);
   const currentRPeaks = computed(() => ecgData.value?.rPeaks ?? []);
   const currentHeartRate = computed(() => hrvData.value?.heartRate ?? heartRate.value);
+  const currentCriteria = computed(() => RHYTHM_CRITERIA[scenario.value]);
 
   // Actions
 
@@ -76,7 +114,12 @@ export const useECGStore = defineStore('ecg', () => {
     const samples: number[] = new Array(totalSamples);
     const config = LEAD_CONFIGS[selectedLead.value] || LEAD_CONFIGS['II'];
     const cycleDuration = 60.0 / heartRate.value;
-    const samplesPerCycle = Math.floor(cycleDuration * samplingRate.value);
+
+    // Seeded from the current settings: identical settings reproduce the
+    // identical signal, so re-submitting the same data gives the same result.
+    const rand = mulberry32(
+      hashString(`${selectedLead.value}|${heartRate.value}|${duration.value}|${samplingRate.value}`)
+    );
 
     for (let i = 0; i < totalSamples; i++) {
       const time = i / samplingRate.value;
@@ -91,7 +134,7 @@ export const useECGStore = defineStore('ecg', () => {
       // Add baseline wander
       samples[i] += 0.03 * Math.sin(2 * Math.PI * 0.15 * time);
       // Add small noise
-      samples[i] += (Math.random() - 0.5) * 0.02;
+      samples[i] += (rand() - 0.5) * 0.02;
     }
 
     return {
@@ -199,25 +242,33 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Arrhythmia detection: tachycardia, bradycardia, ST-elevation
+   * Arrhythmia detection: tachycardia, bradycardia, ST-elevation.
+   * Heart-rate limits come from the selected scenario's criteria.
    */
-  function detectArrhythmias(hrv: HRVData, rPeaks: RPeak[], samples: number[], sr: number): ArrhythmiaEvent[] {
+  function detectArrhythmias(
+    hrv: HRVData,
+    rPeaks: RPeak[],
+    samples: number[],
+    sr: number,
+    scenarioKey: Scenario = scenario.value,
+  ): ArrhythmiaEvent[] {
     const events: ArrhythmiaEvent[] = [];
     const hr = hrv.heartRate;
+    const criteria = RHYTHM_CRITERIA[scenarioKey];
 
-    if (hr > 100) {
+    if (hr > criteria.tachycardiaHr) {
       events.push({
         eventType: 'tachycardia',
-        confidence: Math.min(1.0, (hr - 100) / 50 + 0.6),
+        confidence: Math.min(1.0, (hr - criteria.tachycardiaHr) / 50 + 0.6),
         description: `心率过快 (${hr.toFixed(0)} BPM)，检测到心动过速`,
         timestamp: rPeaks[0]?.time ?? 0,
       });
     }
 
-    if (hr < 60 && hr > 0) {
+    if (hr < criteria.bradycardiaHr && hr > 0) {
       events.push({
         eventType: 'bradycardia',
-        confidence: Math.min(1.0, (60 - hr) / 30 + 0.6),
+        confidence: Math.min(1.0, (criteria.bradycardiaHr - hr) / 30 + 0.6),
         description: `心率过慢 (${hr.toFixed(0)} BPM)，检测到心动过缓`,
         timestamp: rPeaks[0]?.time ?? 0,
       });
@@ -275,6 +326,7 @@ export const useECGStore = defineStore('ecg', () => {
             duration: duration.value,
             sampling_rate: samplingRate.value,
             heart_rate: heartRate.value,
+            scenario: scenario.value,
           }),
         });
         const data: ECGAnalysisResponse = await response.json();
@@ -324,13 +376,14 @@ export const useECGStore = defineStore('ecg', () => {
     const hrv = calculateHRV(peaks, lead.samplingRate);
     hrvData.value = hrv;
 
-    const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate);
+    const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate, scenario.value);
     arrhythmiaEvents.value = events;
 
+    const criteriaNote = `判定口径: ${RHYTHM_CRITERIA[scenario.value].label}`;
     const isNormal = events.some(e => e.eventType === 'normal');
     rhythmDiagnosis.value = isNormal
-      ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
-      : events.map(e => e.description).join(' | ');
+      ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms | ${criteriaNote}`
+      : `${events.map(e => e.description).join(' | ')} | ${criteriaNote}`;
   }
 
   /**
@@ -380,12 +433,23 @@ export const useECGStore = defineStore('ecg', () => {
     }
   }
 
+  /**
+   * Select acquisition scenario (rest / exercise) — switches the rhythm criteria set
+   */
+  function setScenario(value: Scenario) {
+    scenario.value = value;
+    if (isMonitoring.value) {
+      analyzeECG();
+    }
+  }
+
   return {
     // State
     selectedLead,
     heartRate,
     samplingRate,
     duration,
+    scenario,
     isMonitoring,
     ecgData,
     hrvData,
@@ -399,12 +463,14 @@ export const useECGStore = defineStore('ecg', () => {
     currentSamples,
     currentRPeaks,
     currentHeartRate,
+    currentCriteria,
     // Actions
     analyzeECG,
     startMonitoring,
     stopMonitoring,
     selectLead,
     setHeartRate,
+    setScenario,
     generateECGWaveform,
     detectRPeaks,
     calculateHRV,
