@@ -1,10 +1,44 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type {
+  ECGLead,
+  HRVData,
+  RPeak,
+  ArrhythmiaEvent,
+  ECGBackendResponse,
+  Scenario,
+} from '../types';
+import { RHYTHM_CRITERIA } from '../types';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
   return amplitude * Math.exp(-((x - center) ** 2) / (2 * width ** 2));
+}
+
+/**
+ * 由分析参数派生稳定的 32 位哈希种子 (FNV-1a)。
+ * 同一段数据（导联 / 时长 / 采样率 / 心率 / 场景相同）重复提交时
+ * 派生出相同种子，保证生成的信号与结论和第一次一致。
+ */
+function hashSeed(raw: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < raw.length; i++) {
+    h ^= raw.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/** mulberry32 确定性伪随机数发生器 */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 // Lead-specific PQRST configuration
@@ -57,6 +91,8 @@ export const useECGStore = defineStore('ecg', () => {
   const isLoading = ref<boolean>(false);
   const useBackend = ref<boolean>(false);
   const backendUrl = ref<string>('http://localhost:8000');
+  // 采集场景：决定本次判定使用静息还是运动口径
+  const scenario = ref<Scenario>('rest');
 
   let animationTimer: ReturnType<typeof setInterval> | null = null;
   let scrollOffset = ref<number>(0);
@@ -78,6 +114,13 @@ export const useECGStore = defineStore('ecg', () => {
     const cycleDuration = 60.0 / heartRate.value;
     const samplesPerCycle = Math.floor(cycleDuration * samplingRate.value);
 
+    // 种子随全部分析参数（含场景）派生，同参数重复提交结果一致
+    const rng = mulberry32(
+      hashSeed(
+        `${selectedLead.value}|${duration.value}|${samplingRate.value}|${heartRate.value}|${scenario.value}`
+      )
+    );
+
     for (let i = 0; i < totalSamples; i++) {
       const time = i / samplingRate.value;
       const cyclePosition = (time % cycleDuration) / cycleDuration;
@@ -90,8 +133,8 @@ export const useECGStore = defineStore('ecg', () => {
 
       // Add baseline wander
       samples[i] += 0.03 * Math.sin(2 * Math.PI * 0.15 * time);
-      // Add small noise
-      samples[i] += (Math.random() - 0.5) * 0.02;
+      // Add small noise（确定性随机源）
+      samples[i] += (rng() - 0.5) * 0.02;
     }
 
     return {
@@ -199,26 +242,41 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Arrhythmia detection: tachycardia, bradycardia, ST-elevation
+   * Arrhythmia detection：按所选采集场景口径判定
+   * - 心动过速 / 心动过缓：严格越过场景上下限，边界值留在正常区间，不会两边都判
+   * - 心律不规则（疑似房颤）：RR 间期变异系数严格超过场景阈值
+   * - ST 段抬高：与场景无关，始终保留
    */
-  function detectArrhythmias(hrv: HRVData, rPeaks: RPeak[], samples: number[], sr: number): ArrhythmiaEvent[] {
+  function detectArrhythmias(
+    hrv: HRVData,
+    rPeaks: RPeak[],
+    samples: number[],
+    sr: number,
+    currentScenario: Scenario
+  ): ArrhythmiaEvent[] {
     const events: ArrhythmiaEvent[] = [];
     const hr = hrv.heartRate;
+    const criteria = RHYTHM_CRITERIA[currentScenario];
+    const tag = `[${criteria.label}口径]`;
 
-    if (hr > 100) {
+    // 心率等于上限不判，留在正常区间
+    if (hr > criteria.tachycardiaMinHr) {
       events.push({
         eventType: 'tachycardia',
-        confidence: Math.min(1.0, (hr - 100) / 50 + 0.6),
-        description: `心率过快 (${hr.toFixed(0)} BPM)，检测到心动过速`,
+        confidence: Math.min(1.0, (hr - criteria.tachycardiaMinHr) / 50 + 0.6),
+        description:
+          `${tag} 心率过快 (${hr.toFixed(0)} BPM > ${criteria.tachycardiaMinHr})，检测到心动过速`,
         timestamp: rPeaks[0]?.time ?? 0,
       });
     }
 
-    if (hr < 60 && hr > 0) {
+    // 心率等于下限不判；与过速分支严格互斥
+    if (hr > 0 && hr < criteria.bradycardiaMaxHr) {
       events.push({
         eventType: 'bradycardia',
-        confidence: Math.min(1.0, (60 - hr) / 30 + 0.6),
-        description: `心率过慢 (${hr.toFixed(0)} BPM)，检测到心动过缓`,
+        confidence: Math.min(1.0, (criteria.bradycardiaMaxHr - hr) / 30 + 0.6),
+        description:
+          `${tag} 心率过慢 (${hr.toFixed(0)} BPM < ${criteria.bradycardiaMaxHr})，检测到心动过缓`,
         timestamp: rPeaks[0]?.time ?? 0,
       });
     }
@@ -241,21 +299,60 @@ export const useECGStore = defineStore('ecg', () => {
       events.push({
         eventType: 'st_elevation',
         confidence: Math.min(1.0, stElevationCount / Math.max(1, rPeaks.length)),
-        description: '检测到 ST 段抬高，可能提示心肌梗死',
+        description: `${tag} 检测到 ST 段抬高，可能提示心肌梗死`,
         timestamp: rPeaks[0]?.time ?? 0,
       });
+    }
+
+    // Irregular rhythm detection（RR 间期变异系数）
+    if (hrv.nnIntervals.length > 3) {
+      const mean = hrv.nnIntervals.reduce((a, b) => a + b, 0) / hrv.nnIntervals.length;
+      const variance =
+        hrv.nnIntervals.reduce((sum, x) => sum + (x - mean) ** 2, 0) / hrv.nnIntervals.length;
+      const cv = mean > 0 ? Math.sqrt(variance) / mean : 0;
+      if (cv > criteria.irregularCv) {
+        events.push({
+          eventType: 'atrial_fibrillation',
+          confidence: Math.min(1.0, cv * 2),
+          description:
+            `${tag} RR 间期不规则 (CV ${cv.toFixed(2)} > ${criteria.irregularCv.toFixed(2)})，可能提示房颤`,
+          timestamp: rPeaks[0]?.time ?? 0,
+        });
+      }
     }
 
     if (events.length === 0) {
       events.push({
         eventType: 'normal',
         confidence: 1.0,
-        description: '正常窦性心律',
+        description: `${tag} 正常窦性心律`,
         timestamp: rPeaks[0]?.time ?? 0,
       });
     }
 
     return events;
+  }
+
+  /**
+   * 生成整体心律诊断结论，结论统一以本次使用的场景口径开头，
+   * 与后端 get_rhythm_diagnosis 保持一致。
+   */
+  function buildRhythmDiagnosis(
+    events: ArrhythmiaEvent[],
+    hrv: HRVData,
+    currentScenario: Scenario
+  ): string {
+    const tag = `[${RHYTHM_CRITERIA[currentScenario].label}口径] `;
+    const types = events.map((e) => e.eventType);
+
+    if (types.includes('st_elevation')) return tag + 'ST 段抬高 - 建议立即就医检查';
+    if (types.includes('tachycardia') && types.includes('atrial_fibrillation')) {
+      return tag + '快速房颤 - 建议进一步心脏评估';
+    }
+    if (types.includes('tachycardia')) return tag + '窦性心动过速 - 请结合临床症状判断';
+    if (types.includes('bradycardia')) return tag + '窦性心动过缓 - 建议关注心率变化';
+    if (types.includes('atrial_fibrillation')) return tag + '心律不规则 - 疑似房颤，建议 Holter 监测';
+    return tag + `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`;
   }
 
   /**
@@ -275,9 +372,10 @@ export const useECGStore = defineStore('ecg', () => {
             duration: duration.value,
             sampling_rate: samplingRate.value,
             heart_rate: heartRate.value,
+            scenario: scenario.value,
           }),
         });
-        const data: ECGAnalysisResponse = await response.json();
+        const data: ECGBackendResponse = await response.json();
         ecgData.value = {
           leadName: data.lead.lead_name,
           samplingRate: data.lead.sampling_rate,
@@ -303,6 +401,10 @@ export const useECGStore = defineStore('ecg', () => {
           timestamp: evt.timestamp,
         }));
         rhythmDiagnosis.value = data.rhythm_diagnosis;
+        // 以后端实际使用的场景口径为准（旧后端缺字段时保留本地选择）
+        if (data.scenario) {
+          scenario.value = data.scenario;
+        }
       } catch (error) {
         console.error('Backend API error:', error);
         // Fallback to frontend simulation
@@ -324,13 +426,10 @@ export const useECGStore = defineStore('ecg', () => {
     const hrv = calculateHRV(peaks, lead.samplingRate);
     hrvData.value = hrv;
 
-    const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate);
+    const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate, scenario.value);
     arrhythmiaEvents.value = events;
 
-    const isNormal = events.some(e => e.eventType === 'normal');
-    rhythmDiagnosis.value = isNormal
-      ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
-      : events.map(e => e.description).join(' | ');
+    rhythmDiagnosis.value = buildRhythmDiagnosis(events, hrv, scenario.value);
   }
 
   /**
@@ -380,6 +479,17 @@ export const useECGStore = defineStore('ecg', () => {
     }
   }
 
+  /**
+   * 切换采集场景（静息 / 运动），后续判定按对应口径执行
+   */
+  function setScenario(next: Scenario) {
+    if (next === scenario.value) return;
+    scenario.value = next;
+    if (isMonitoring.value) {
+      analyzeECG();
+    }
+  }
+
   return {
     // State
     selectedLead,
@@ -395,6 +505,7 @@ export const useECGStore = defineStore('ecg', () => {
     useBackend,
     backendUrl,
     scrollOffset,
+    scenario,
     // Getters
     currentSamples,
     currentRPeaks,
@@ -405,9 +516,11 @@ export const useECGStore = defineStore('ecg', () => {
     stopMonitoring,
     selectLead,
     setHeartRate,
+    setScenario,
     generateECGWaveform,
     detectRPeaks,
     calculateHRV,
     detectArrhythmias,
+    buildRhythmDiagnosis,
   };
 });

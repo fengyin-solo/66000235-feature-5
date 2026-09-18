@@ -1,7 +1,29 @@
+import hashlib
+
 import numpy as np
 from scipy import signal
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import math
+
+from app.services.thresholds import get_thresholds, get_scenario_label
+
+
+def analysis_seed(
+    lead_name: str,
+    duration: float,
+    sampling_rate: int,
+    heart_rate: float,
+    scenario: str,
+) -> int:
+    """
+    由分析请求参数派生确定性随机种子。
+
+    同一段数据（导联 / 时长 / 采样率 / 心率 / 场景完全相同）重复提交时
+    派生出相同种子，因此生成的信号与最终结论与第一次保持一致。
+    """
+    raw = f"{lead_name}|{duration}|{sampling_rate}|{heart_rate}|{scenario}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
 
 
 def gaussian(x: np.ndarray, amplitude: float, center: float, width: float) -> np.ndarray:
@@ -82,10 +104,12 @@ def generate_ecg_signal(
     heart_rate: float = 72.0,
     noise_level: float = 0.02,
     include_arrhythmia: bool = False,
+    scenario: str = "rest",
+    seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate a realistic ECG signal for a specified lead.
-    
+
     Args:
         lead_name: ECG lead name (I, II, III, aVR, aVL, aVF, V1-V6)
         duration: Signal duration in seconds
@@ -93,10 +117,16 @@ def generate_ecg_signal(
         heart_rate: Heart rate in BPM
         noise_level: Baseline noise amplitude
         include_arrhythmia: Whether to simulate arrhythmia events
-        
+        scenario: 采集场景 (rest/exercise)，参与随机种子派生
+        seed: 随机种子；不传时按请求参数派生，保证同参数重复提交结果一致
+
     Returns:
         Tuple of (time_array, ecg_signal)
     """
+    if seed is None:
+        seed = analysis_seed(lead_name, duration, sampling_rate, heart_rate, scenario)
+    rng = np.random.default_rng(seed)
+
     total_samples = int(duration * sampling_rate)
     t = np.linspace(0, duration, total_samples)
     ecg = np.zeros(total_samples)
@@ -113,15 +143,15 @@ def generate_ecg_signal(
             continue
 
         t_cycle = t[mask] - start_time
-        
+
         # Add slight HRV variation to each beat
-        hrv_factor = 1.0 + np.random.normal(0, 0.02)
+        hrv_factor = 1.0 + rng.normal(0, 0.02)
         modified_hr = heart_rate * hrv_factor
         cycle_config = lead_config.copy()
 
         # Simulate arrhythmia if requested
         if include_arrhythmia and beat_count > 2:
-            if np.random.random() < 0.1:  # 10% chance of PVC
+            if rng.random() < 0.1:  # 10% chance of PVC
                 cycle_config["r_amplitude"] *= 1.8
                 cycle_config["t_amplitude"] *= -0.5
                 cycle_config["q_amplitude"] *= 0.5
@@ -131,9 +161,9 @@ def generate_ecg_signal(
 
     # Add baseline wander (low-frequency noise ~0.15 Hz)
     baseline_wander = 0.03 * np.sin(2 * np.pi * 0.15 * t)
-    
+
     # Add high-frequency noise (muscle artifact)
-    noise = noise_level * np.random.randn(total_samples)
+    noise = noise_level * rng.standard_normal(total_samples)
 
     ecg = ecg + baseline_wander + noise
 
@@ -256,38 +286,54 @@ def detect_arrhythmia(
     hrv: Dict[str, Any],
     ecg_signal: np.ndarray,
     sampling_rate: int = 500,
+    scenario: str = "rest",
 ) -> List[Dict[str, Any]]:
     """
     Detect arrhythmia events based on R-peaks, HRV metrics, and signal morphology.
-    
+
+    判定口径随采集场景 (rest 静息 / exercise 运动) 切换，阈值边界本身属于
+    正常区间（严格 > / < 才判异常），因此边界心率不会同时判为过速与过缓。
+
     Detects:
-    - Tachycardia: HR > 100 BPM
-    - Bradycardia: HR < 60 BPM
+    - Tachycardia: HR 严格高于场景心动过速上限
+    - Bradycardia: HR 严格低于场景心动过缓下限
     - ST-segment elevation: potential myocardial infarction
-    - Irregular rhythm patterns
+    - Irregular rhythm patterns: RR 间期变异系数严格高于场景阈值
     """
+    thresholds = get_thresholds(scenario)
+    label = thresholds["label"]
+    tachy_limit = thresholds["tachycardia_min_hr"]
+    brady_limit = thresholds["bradycardia_max_hr"]
+    irregular_cv_limit = thresholds["irregular_cv"]
+
     events = []
     heart_rate = hrv["heart_rate"]
 
-    # Tachycardia detection
-    if heart_rate > 100:
+    # Tachycardia detection（心率等于上限不判，留在正常区间）
+    if heart_rate > tachy_limit:
         events.append({
             "event_type": "tachycardia",
-            "confidence": min(1.0, (heart_rate - 100) / 50 + 0.6),
-            "description": f"心率过快 ({heart_rate:.0f} BPM)，检测到心动过速",
+            "confidence": min(1.0, (heart_rate - tachy_limit) / 50 + 0.6),
+            "description": (
+                f"[{label}口径] 心率过快 ({heart_rate:.0f} BPM > {tachy_limit:.0f})，"
+                f"检测到心动过速"
+            ),
             "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
         })
 
-    # Bradycardia detection
-    if heart_rate < 60 and heart_rate > 0:
+    # Bradycardia detection（心率等于下限不判，留在正常区间；与过速严格互斥）
+    if 0 < heart_rate < brady_limit:
         events.append({
             "event_type": "bradycardia",
-            "confidence": min(1.0, (60 - heart_rate) / 30 + 0.6),
-            "description": f"心率过慢 ({heart_rate:.0f} BPM)，检测到心动过缓",
+            "confidence": min(1.0, (brady_limit - heart_rate) / 30 + 0.6),
+            "description": (
+                f"[{label}口径] 心率过慢 ({heart_rate:.0f} BPM < {brady_limit:.0f})，"
+                f"检测到心动过缓"
+            ),
             "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
         })
 
-    # ST-segment elevation detection
+    # ST-segment elevation detection（与场景口径无关，始终保留）
     if len(r_peaks) > 0:
         st_elevation_count = 0
         for rp in r_peaks:
@@ -306,7 +352,7 @@ def detect_arrhythmia(
             events.append({
                 "event_type": "st_elevation",
                 "confidence": min(1.0, st_elevation_count / max(1, len(r_peaks))),
-                "description": "检测到 ST 段抬高，可能提示心肌梗死",
+                "description": f"[{label}口径] 检测到 ST 段抬高，可能提示心肌梗死",
                 "timestamp": r_peaks[0]["time"],
             })
 
@@ -314,11 +360,14 @@ def detect_arrhythmia(
     if len(hrv.get("nn_intervals", [])) > 3:
         nn_array = np.array(hrv["nn_intervals"])
         cv = np.std(nn_array) / np.mean(nn_array) if np.mean(nn_array) > 0 else 0
-        if cv > 0.15:
+        if cv > irregular_cv_limit:
             events.append({
                 "event_type": "atrial_fibrillation",
                 "confidence": min(1.0, cv * 2),
-                "description": "RR 间期不规则，可能提示房颤",
+                "description": (
+                    f"[{label}口径] RR 间期不规则 (CV {cv:.2f} > {irregular_cv_limit:.2f})，"
+                    f"可能提示房颤"
+                ),
                 "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
             })
 
@@ -327,28 +376,38 @@ def detect_arrhythmia(
         events.append({
             "event_type": "normal",
             "confidence": 1.0,
-            "description": "正常窦性心律",
+            "description": f"[{label}口径] 正常窦性心律",
             "timestamp": r_peaks[0]["time"] if r_peaks else 0.0,
         })
 
     return events
 
 
-def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str, Any]) -> str:
-    """Generate overall rhythm diagnosis based on detected events and HRV."""
+def get_rhythm_diagnosis(
+    arrhythmia_events: List[Dict[str, Any]],
+    hrv: Dict[str, Any],
+    scenario: str = "rest",
+) -> str:
+    """Generate overall rhythm diagnosis based on detected events and HRV.
+
+    结论统一以本次实际使用的场景口径（[静息口径] / [运动口径]）开头，
+    明确这一次按哪一套上下限判定。
+    """
+    label = get_scenario_label(scenario)
+    prefix = f"[{label}口径] "
     event_types = [e["event_type"] for e in arrhythmia_events]
 
     if "st_elevation" in event_types:
-        return "ST 段抬高 - 建议立即就医检查"
+        return prefix + "ST 段抬高 - 建议立即就医检查"
     elif "tachycardia" in event_types and "atrial_fibrillation" in event_types:
-        return "快速房颤 - 建议进一步心脏评估"
+        return prefix + "快速房颤 - 建议进一步心脏评估"
     elif "tachycardia" in event_types:
-        return "窦性心动过速 - 请结合临床症状判断"
+        return prefix + "窦性心动过速 - 请结合临床症状判断"
     elif "bradycardia" in event_types:
-        return "窦性心动过缓 - 建议关注心率变化"
+        return prefix + "窦性心动过缓 - 建议关注心率变化"
     elif "atrial_fibrillation" in event_types:
-        return "心律不规则 - 疑似房颤，建议 Holter 监测"
+        return prefix + "心律不规则 - 疑似房颤，建议 Holter 监测"
     else:
         hr = hrv.get("heart_rate", 0)
         sdnn = hrv.get("sdnn", 0)
-        return f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms"
+        return prefix + f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms"

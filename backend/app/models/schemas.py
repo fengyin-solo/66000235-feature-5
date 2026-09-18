@@ -27,6 +27,11 @@ class ArrhythmiaType(str, Enum):
     PVC = "premature_ventricular_contraction"
 
 
+class ScenarioType(str, Enum):
+    REST = "rest"
+    EXERCISE = "exercise"
+
+
 class RPeak(BaseModel):
     index: int = Field(..., description="Sample index of R-peak")
     time: float = Field(..., description="Time in seconds")
@@ -61,6 +66,10 @@ class ECGAnalysisRequest(BaseModel):
     duration: float = Field(default=10.0, ge=1.0, le=60.0, description="Duration in seconds")
     sampling_rate: int = Field(default=500, ge=100, le=1000, description="Sampling rate in Hz")
     heart_rate: float = Field(default=72.0, ge=30, le=200, description="Simulated heart rate BPM")
+    scenario: ScenarioType = Field(
+        default=ScenarioType.REST,
+        description="采集场景：rest=静息口径，exercise=运动口径",
+    )
 
 
 class ECGAnalysisResponse(BaseModel):
@@ -68,3 +77,5 @@ class ECGAnalysisResponse(BaseModel):
     hrv: HRVMetrics = Field(..., description="HRV analysis results")
     arrhythmia_events: List[ArrhythmiaEvent] = Field(default_factory=list, description="Detected arrhythmia events")
     rhythm_diagnosis: str = Field(..., description="Overall rhythm diagnosis")
+    scenario: ScenarioType = Field(..., description="本次判定实际使用的采集场景口径")
+    scenario_label: str = Field(..., description="场景口径中文名，如 静息 / 运动")

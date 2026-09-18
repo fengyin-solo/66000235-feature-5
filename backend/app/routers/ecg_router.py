@@ -18,6 +18,7 @@ from app.services.ecg_service import (
     detect_arrhythmia,
     get_rhythm_diagnosis,
 )
+from app.services.thresholds import get_scenario_label
 
 router = APIRouter()
 
@@ -39,12 +40,16 @@ async def analyze_ecg(request: ECGAnalysisRequest):
     3. HRV metrics calculation
     4. Arrhythmia detection and classification
     """
-    # Generate ECG signal
+    # 本次判定实际使用的场景口径
+    scenario = request.scenario.value
+
+    # Generate ECG signal（种子按请求参数派生，同参数重复提交结果一致）
     time_array, ecg_signal = generate_ecg_signal(
         lead_name=request.lead_name.value,
         duration=request.duration,
         sampling_rate=request.sampling_rate,
         heart_rate=request.heart_rate,
+        scenario=scenario,
     )
 
     # Detect R-peaks using Pan-Tompkins algorithm
@@ -58,9 +63,9 @@ async def analyze_ecg(request: ECGAnalysisRequest):
     hrv_raw = calculate_hrv(r_peaks_raw, request.sampling_rate)
     hrv = HRVMetrics(**hrv_raw)
 
-    # Detect arrhythmia events
+    # Detect arrhythmia events（按所选场景口径执行）
     arrhythmia_raw = detect_arrhythmia(
-        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate
+        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate, scenario
     )
     arrhythmia_events = []
     for evt in arrhythmia_raw:
@@ -74,7 +79,7 @@ async def analyze_ecg(request: ECGAnalysisRequest):
         )
 
     # Generate rhythm diagnosis
-    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw)
+    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw, scenario)
 
     # Build lead data
     lead = ECGLead(
@@ -90,4 +95,6 @@ async def analyze_ecg(request: ECGAnalysisRequest):
         hrv=hrv,
         arrhythmia_events=arrhythmia_events,
         rhythm_diagnosis=diagnosis,
+        scenario=request.scenario,
+        scenario_label=get_scenario_label(scenario),
     )
